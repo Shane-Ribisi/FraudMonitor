@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fraud Monitoring Dashboard</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --text:#1c2733; --muted:#6b7a8c; --line:#e3e8ee;
+          --ok:#1a8f5a; --warn:#d98a00; --bad:#d6343f; --blue:#0a5cc2; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12171d; --card:#1b232c; --text:#e6ebf0; --muted:#8a99a8; --line:#2a3541; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; background:var(--blue); color:#fff; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin:0; font-size:20px; }
+  header a { color:#fff; font-size:14px; }
+  main { padding:20px 24px; max-width:1400px; margin:auto; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:20px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .stat .n { font-size:26px; font-weight:600; }
+  .stat .l { color:var(--muted); font-size:13px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns:1fr; } }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; overflow-x:auto; }
+  section h2 { margin:0 0 10px; font-size:16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:500; }
+  .pill { padding:2px 8px; border-radius:10px; font-size:12px; color:#fff; }
+  .Settled { background:var(--ok); } .Flagged { background:var(--warn); }
+  .Blocked, .High { background:var(--bad); } .Declined { background:var(--muted); }
+  .Medium { background:var(--warn); } .Low { background:var(--ok); }
+  .form { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; align-items:end; }
+  .form label { font-size:12px; color:var(--muted); display:block; margin-bottom:3px; }
+  .form input, .form select { width:100%; padding:7px; border:1px solid var(--line); border-radius:4px; background:var(--bg); color:var(--text); font-size:14px; }
+  .primary { background:var(--blue); color:#fff; border:none; padding:8px 14px; font-size:14px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  #result { margin-top:10px; padding:10px; border-radius:6px; border:1px solid var(--line); font-size:14px; display:none; }
+  button { cursor:pointer; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:4px; padding:2px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Real-Time Transaction &amp; Fraud Monitoring</h1>
+  <a href="/swagger">API docs (Swagger)</a>
+</header>
+<main>
+  <section style="margin-bottom:20px">
+    <h2>New transaction</h2>
+    <div class="form">
+      <div><label>Account</label><select id="f-acc"></select></div>
+      <div><label>Amount (R)</label><input id="f-amt" type="number" min="0.01" step="0.01" value="250"></div>
+      <div><label>Merchant</label><input id="f-mer" value="Woolworths"></div>
+      <div><label>Country (2-letter)</label><input id="f-cty" value="ZA" maxlength="2"></div>
+      <div><button class="primary" onclick="submitTx()">Process transaction</button></div>
+    </div>
+    <div class="row">
+      <span style="color:var(--muted);font-size:13px">Quick tests:</span>
+      <button onclick="preset(75000,'ZA')">Large amount (R75,000)</button>
+      <button onclick="preset(1500,'RU')">Foreign location (RU)</button>
+      <button onclick="burst()">Velocity burst (7 x R10)</button>
+    </div>
+    <div id="result"></div>
+  </section>
+  <div class="stats" id="stats"></div>
+  <div class="grid">
+    <section><h2>Live transactions</h2><table id="tx"></table></section>
+    <section><h2>Open fraud alerts</h2><table id="alerts"></table></section>
+  </div>
+  <section style="margin-top:20px"><h2>Audit log (append-only)</h2><table id="audit"></table></section>
+</main>
+<script>
+const fmt = n => 'R' + Number(n).toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
+const time = t => new Date(t + (t.endsWith('Z') ? '' : 'Z')).toLocaleTimeString();
+const pill = s => `<span class="pill ${s}">${s}</span>`;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function get(url) { const r = await fetch(url); return r.json(); }
+
+async function resolveAlert(id) {
+  await fetch(`/api/alerts/${id}/resolve`, { method:'POST' });
+  refresh();
+}
+
+async function loadAccounts() {
+  const accs = await get('/api/accounts');
+  const sel = document.getElementById('f-acc');
+  const cur = sel.value;
+  sel.innerHTML = accs.map(a => `<option value="${a.accountNumber}">${a.accountNumber} - ${esc(a.holderName)} (${fmt(a.balance)}, ${a.homeCountry})</option>`).join('');
+  if (cur) sel.value = cur;
+}
+
+async function send(amount, country, merchant) {
+  const r = await fetch('/api/transactions', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      accountNumber: document.getElementById('f-acc').value,
+      amount: Number(amount), merchant: merchant || 'Manual', country })
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function showResult(t) {
+  const el = document.getElementById('result');
+  el.style.display = 'block';
+  el.innerHTML = `<b>${pill(t.status)}</b> Tx #${t.id}: ${fmt(t.amount)} at ${esc(t.merchant)} (${t.country}), risk ${t.riskScore}, ${t.processingMs} ms` +
+    (t.alerts.length ? '<br>' + t.alerts.map(esc).join('<br>') : '');
+}
+
+async function submitTx() {
+  try {
+    const t = await send(document.getElementById('f-amt').value,
+      document.getElementById('f-cty').value.toUpperCase(), document.getElementById('f-mer').value);
+    showResult(t); loadAccounts(); refresh();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+function preset(amount, country) {
+  document.getElementById('f-amt').value = amount;
+  document.getElementById('f-cty').value = country;
+  submitTx();
+}
+
+async function burst() {
+  try {
+    let last;
+    for (let i = 0; i < 7; i++) last = await send(10, document.getElementById('f-cty').value.toUpperCase(), 'Burst test');
+    showResult(last); loadAccounts(); refresh();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+async function refresh() {
+  try {
+    const [s, tx, al, au] = await Promise.all([
+      get('/api/stats'), get('/api/transactions?take=15'),
+      get('/api/alerts?unresolved=true&take=15'), get('/api/audit?take=10')]);
+
+    document.getElementById('stats').innerHTML = [
+      ['Total', s.total], ['Settled', s.settled], ['Flagged', s.flagged], ['Blocked', s.blocked],
+      ['Declined', s.declined], ['Open alerts', s.openAlerts], ['Avg processing', s.avgProcessingMs + ' ms']
+    ].map(([l, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
+
+    document.getElementById('tx').innerHTML =
+      '<tr><th>Time</th><th>Account</th><th>Amount</th><th>Merchant</th><th>Country</th><th>Risk</th><th>Status</th></tr>' +
+      tx.map(t => `<tr><td>${time(t.timestamp)}</td><td>${t.accountNumber}</td><td>${fmt(t.amount)}</td><td>${esc(t.merchant)}</td><td>${t.country}</td><td>${t.riskScore}</td><td>${pill(t.status)}</td></tr>`).join('');
+
+    document.getElementById('alerts').innerHTML =
+      '<tr><th>Time</th><th>Tx</th><th>Rule</th><th>Severity</th><th>Details</th><th></th></tr>' +
+      al.map(a => `<tr><td>${time(a.createdAt)}</td><td>#${a.transactionId}</td><td>${a.rule}</td><td>${pill(a.severity)}</td><td>${esc(a.description)}</td><td><button onclick="resolveAlert(${a.id})">Resolve</button></td></tr>`).join('');
+
+    document.getElementById('audit').innerHTML =
+      '<tr><th>#</th><th>Time</th><th>Action</th><th>Entity</th><th>Details</th></tr>' +
+      au.map(a => `<tr><td>${a.id}</td><td>${time(a.timestamp)}</td><td>${a.action}</td><td>${a.entity} ${a.entityId}</td><td>${esc(a.details)}</td></tr>`).join('');
+  } catch (e) { console.error(e); }
+}
+loadAccounts();
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
